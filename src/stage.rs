@@ -1,5 +1,7 @@
-use super::*;
+use crate::dependency::ShuffleDependencyTrait;
+use crate::rdd::RddBase;
 use std::cmp::Ordering;
+use std::fmt::Display;
 use std::sync::Arc;
 
 // this is strange. see into this in more detail
@@ -37,7 +39,11 @@ impl Ord for Stage {
         self.id.cmp(&other.id)
     }
 }
-
+impl Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Stage {}", self.id)
+    }
+}
 impl Stage {
     pub fn get_rdd(&self) -> Arc<dyn RddBase> {
         self.rdd.clone()
@@ -58,7 +64,7 @@ impl Stage {
             rdd: rdd.clone(),
             output_locs: {
                 let mut v = Vec::new();
-                for i in 0..rdd.number_of_splits() {
+                for _ in 0..rdd.number_of_splits() {
                     v.push(Vec::new());
                 }
                 v
@@ -71,18 +77,20 @@ impl Stage {
         if self.parents.is_empty() && !self.is_shuffle_map {
             true
         } else {
-            info!(
-                "num available outputs and num partitions in is available method in stage{} {:?}",
-                self.num_available_outputs, self.num_partitions
+            log::debug!(
+                "num available outputs {}, and num partitions {}, in is available method in stage",
+                self.num_available_outputs,
+                self.num_partitions
             );
             self.num_available_outputs == self.num_partitions
         }
     }
 
     pub fn add_output_loc(&mut self, partition: usize, host: String) {
-        info!(
-            "adding loc for partition inside stage {} {:?}",
-            partition, host
+        log::debug!(
+            "adding loc for partition inside stage {} @{}",
+            partition,
+            host
         );
         if !self.output_locs[partition].is_empty() {
             self.num_available_outputs += 1;
@@ -90,20 +98,16 @@ impl Stage {
         self.output_locs[partition].push(host);
     }
 
-    pub fn remove_output_loc(&mut self, partition: usize, host: String) {
+    pub fn remove_output_loc(&mut self, partition: usize, host: &str) {
         let prev_vec = self.output_locs[partition].clone();
         let new_vec = prev_vec
             .clone()
             .into_iter()
-            .filter(|x| x != &host)
+            .filter(|x| x != host)
             .collect::<Vec<_>>();
         if (!prev_vec.is_empty()) && (new_vec.is_empty()) {
             self.num_available_outputs -= 1;
         }
         self.output_locs[partition] = new_vec;
-    }
-
-    pub fn to_string(&self) -> String {
-        format!("Stage {}", self.id)
     }
 }

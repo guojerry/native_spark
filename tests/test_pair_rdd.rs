@@ -1,9 +1,15 @@
 use native_spark::*;
+
+use std::sync::Arc;
+
 extern crate serde_closure;
+use once_cell::sync::Lazy;
+
+static CONTEXT: Lazy<Arc<Context>> = Lazy::new(|| Context::new().unwrap());
 
 #[test]
 fn test_group_by() {
-    let sc = Context::new("local").unwrap();
+    let sc = CONTEXT.clone();
     let vec = vec![
         ("x".to_string(), 1),
         ("x".to_string(), 2),
@@ -23,10 +29,8 @@ fn test_group_by() {
     ];
     let r = sc.make_rdd(vec, 4);
     let g = r.group_by_key(4);
-    let mut res = g.collect();
+    let mut res = g.collect().unwrap();
     res.sort();
-    println!("res {:?}", res);
-
     let expected = vec![
         ("x".to_string(), vec![1, 2, 3, 4, 5, 6, 7]),
         ("y".to_string(), vec![1, 2, 3, 4, 5, 6, 7, 8]),
@@ -36,14 +40,14 @@ fn test_group_by() {
 
 #[test]
 fn test_join() {
-    let sc = Context::new("local").unwrap();
+    let sc = CONTEXT.clone();
     let col1 = vec![
         (1, ("A".to_string(), "B".to_string())),
         (2, ("C".to_string(), "D".to_string())),
         (3, ("E".to_string(), "F".to_string())),
         (4, ("G".to_string(), "H".to_string())),
     ];
-    let col1 = sc.parallelize(col1, 4);
+    let col1 = sc.clone().parallelize(col1, 4);
     let col2 = vec![
         (1, "A1".to_string()),
         (1, "A2".to_string()),
@@ -54,7 +58,7 @@ fn test_join() {
     ];
     let col2 = sc.parallelize(col2, 4);
     let inner_joined_rdd = col2.join(col1.clone(), 4);
-    let mut res = inner_joined_rdd.collect();
+    let mut res = inner_joined_rdd.collect().unwrap();
     println!("res {:?}", res);
     res.sort();
 

@@ -1,13 +1,16 @@
-mod file_reader;
+use std::sync::Arc;
 
-use crate::*;
+use crate::context::Context;
+use crate::rdd::Rdd;
+use crate::serializable_traits::{Data, SerFunc};
+use serde_traitobject::Arc as SerArc;
 
-pub use file_reader::{DistributedLocalReader, LocalFsReaderConfig};
+mod local_file_reader;
+pub use local_file_reader::{LocalFsReader, LocalFsReaderConfig};
 
-pub trait ReaderConfiguration<D>
-where
-    D: Data,
-{
-    type Reader: Chunkable<D> + Sized;
-    fn make_reader(self) -> Self::Reader;
+pub trait ReaderConfiguration<I: Data> {
+    fn make_reader<F, O>(self, context: Arc<Context>, decoder: F) -> SerArc<dyn Rdd<Item = O>>
+    where
+        O: Data,
+        F: SerFunc(I) -> O;
 }

@@ -1,44 +1,56 @@
-use super::*;
-
-use capnp::serialize_packed;
-//use chrono::{DateTime, Utc};
-//use downcast_rs::Downcast;
-use parking_lot::Mutex;
 use std::any::Any;
-use std::collections::btree_map::BTreeMap;
-use std::collections::btree_set::BTreeSet;
-use std::collections::vec_deque::VecDeque;
-use std::collections::{HashMap, HashSet};
-//use std::intrinsics;
-//use std::io::prelude::*;
-//use std::io::BufReader;
+use std::collections::{btree_set::BTreeSet, vec_deque::VecDeque, HashMap, HashSet};
 use std::iter::FromIterator;
-//use std::net::TcpListener;
-use std::net::{Ipv4Addr, TcpStream};
-use std::option::Option;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
-use threadpool::ThreadPool;
+
+use crate::dag_scheduler::{CompletionEvent, TastEndReason};
+use crate::dependency::ShuffleDependencyTrait;
+use crate::env;
+use crate::error::{Error, Result};
+use crate::job::{Job, JobTracker};
+use crate::local_scheduler::LocalScheduler;
+use crate::map_output_tracker::MapOutputTracker;
+use crate::rdd::{Rdd, RddBase};
+use crate::result_task::ResultTask;
+use crate::scheduler::{EventQueue, NativeScheduler};
+use crate::serializable_traits::{Data, SerFunc};
+use crate::serialized_data_capnp::serialized_data;
+use crate::shuffle::ShuffleMapTask;
+use crate::stage::Stage;
+use crate::task::{TaskBase, TaskContext, TaskOption, TaskResult};
+use crate::utils;
+use capnp::message::ReaderOptions;
+use capnp_futures::serialize as capnp_serialize;
+use dashmap::DashMap;
+use parking_lot::Mutex;
+use tokio::net::TcpStream;
+use tokio_util::compat::{Tokio02AsyncReadCompatExt, Tokio02AsyncWriteCompatExt};
+
+const CAPNP_BUF_READ_OPTS: ReaderOptions = ReaderOptions {
+    traversal_limit_in_words: std::u64::MAX,
+    nesting_limit: 64,
+};
 
 //just for now, creating an entire scheduler functions without dag scheduler trait. Later change it to extend from dag scheduler
 #[derive(Clone, Default)]
 pub struct DistributedScheduler {
-    threads: usize,
     max_failures: usize,
     attempt_id: Arc<AtomicUsize>,
     resubmit_timeout: u128,
     poll_timeout: u64,
-    event_queues: Arc<Mutex<HashMap<usize, VecDeque<CompletionEvent>>>>,
+    event_queues: EventQueue,
     next_job_id: Arc<AtomicUsize>,
     next_run_id: Arc<AtomicUsize>,
     next_task_id: Arc<AtomicUsize>,
     next_stage_id: Arc<AtomicUsize>,
-    id_to_stage: Arc<Mutex<HashMap<usize, Stage>>>,
-    shuffle_to_map_stage: Arc<Mutex<HashMap<usize, Stage>>>,
-    cache_locs: Arc<Mutex<HashMap<usize, Vec<Vec<Ipv4Addr>>>>>,
+    stage_cache: Arc<DashMap<usize, Stage>>,
+    shuffle_to_map_stage: Arc<DashMap<usize, Stage>>,
+    cache_locs: Arc<DashMap<usize, Vec<Vec<Ipv4Addr>>>>,
     master: bool,
     framework_name: String,
     is_registered: bool, //TODO check if it is necessary
@@ -48,42 +60,40 @@ pub struct DistributedScheduler {
     taskid_to_slaveid: HashMap<String, String>,
     job_tasks: HashMap<usize, HashSet<String>>,
     slaves_with_executors: HashSet<String>,
-    server_uris: Arc<Mutex<VecDeque<(String, u16)>>>,
+    server_uris: Arc<Mutex<VecDeque<SocketAddrV4>>>,
     port: u16,
     map_output_tracker: MapOutputTracker,
+    // TODO fix proper locking mechanism
+    scheduler_lock: Arc<Mutex<bool>>,
 }
 
 impl DistributedScheduler {
     pub fn new(
-        threads: usize,
         max_failures: usize,
         master: bool,
-        servers: Option<Vec<(String, u16)>>,
+        servers: Option<Vec<SocketAddrV4>>,
         port: u16,
-        //        map_output_tracker: MapOutputTracker,
     ) -> Self {
-        //        unimplemented!()
-        info!(
-            "starting distributed scheduler in client - {} {}",
-            master, port
+        log::debug!(
+            "starting distributed scheduler @ port {} (in master mode: {})",
+            port,
+            master,
         );
         DistributedScheduler {
-            //            threads,
-            threads: 100,
             max_failures,
             attempt_id: Arc::new(AtomicUsize::new(0)),
             resubmit_timeout: 2000,
-            poll_timeout: 500,
-            event_queues: Arc::new(Mutex::new(HashMap::new())),
+            poll_timeout: 50,
+            event_queues: Arc::new(DashMap::new()),
             next_job_id: Arc::new(AtomicUsize::new(0)),
             next_run_id: Arc::new(AtomicUsize::new(0)),
             next_task_id: Arc::new(AtomicUsize::new(0)),
             next_stage_id: Arc::new(AtomicUsize::new(0)),
-            id_to_stage: Arc::new(Mutex::new(HashMap::new())),
-            shuffle_to_map_stage: Arc::new(Mutex::new(HashMap::new())),
-            cache_locs: Arc::new(Mutex::new(HashMap::new())),
+            stage_cache: Arc::new(DashMap::new()),
+            shuffle_to_map_stage: Arc::new(DashMap::new()),
+            cache_locs: Arc::new(DashMap::new()),
             master,
-            framework_name: "spark".to_string(),
+            framework_name: "native_spark".to_string(),
             is_registered: true, //TODO check if it is necessary
             active_jobs: HashMap::new(),
             active_job_queue: Vec::new(),
@@ -92,809 +102,298 @@ impl DistributedScheduler {
             job_tasks: HashMap::new(),
             slaves_with_executors: HashSet::new(),
             server_uris: if let Some(servers) = servers {
-                let mut vec = VecDeque::new();
-                for (i, j) in servers {
-                    vec.push_front((i, j));
-                }
-                Arc::new(Mutex::new(VecDeque::from_iter(vec)))
+                Arc::new(Mutex::new(VecDeque::from_iter(servers)))
             } else {
                 Arc::new(Mutex::new(VecDeque::new()))
             },
             port,
-            map_output_tracker: env::env.map_output_tracker.clone(),
+            map_output_tracker: env::Env::get().map_output_tracker.clone(),
+            scheduler_lock: Arc::new(Mutex::new(true)),
         }
-    }
-
-    fn get_cache_locs(&self, rdd: Arc<dyn RddBase>) -> Option<Vec<Vec<Ipv4Addr>>> {
-        let cache_locs = self.cache_locs.lock();
-        let locs_opt = cache_locs.get(&rdd.get_rdd_id());
-        match locs_opt {
-            Some(locs) => Some(locs.clone()),
-            None => None,
-        }
-        //        (self.cache_locs.lock().get(&rdd.get_rdd_id())).clone()
-    }
-
-    fn update_cache_locs(&self) {
-        let mut locs = self.cache_locs.lock();
-        *locs = env::env.cache_tracker.get_location_snapshot();
     }
 
     fn task_ended(
-        event_queues: Arc<Mutex<HashMap<usize, VecDeque<CompletionEvent>>>>,
+        event_queues: Arc<DashMap<usize, VecDeque<CompletionEvent>>>,
         task: Box<dyn TaskBase>,
         reason: TastEndReason,
         result: Box<dyn Any + Send + Sync>,
         //TODO accumvalues needs to be done
     ) {
         let result = Some(result);
-        if let Some(queue) = event_queues.lock().get_mut(&(task.get_run_id())) {
+        if let Some(mut queue) = event_queues.get_mut(&(task.get_run_id())) {
             queue.push_back(CompletionEvent {
                 task,
                 reason,
-                //                    result: Some(Box::new(result)),
                 result,
                 accum_updates: HashMap::new(),
             });
         } else {
-            info!("ignoring completion event for DAG Job");
+            log::debug!("ignoring completion event for DAG Job");
         }
     }
 
-    fn get_shuffle_map_stage(&self, shuf: Arc<dyn ShuffleDependencyTrait>) -> Stage {
-        info!("inside get_shufflemap stage");
-        let stage = match self.shuffle_to_map_stage.lock().get(&shuf.get_shuffle_id()) {
-            Some(s) => Some(s.clone()),
-            None => None,
-        };
-        match stage {
-            Some(stage) => stage.clone(),
-            None => {
-                info!("inside get_shufflemap stage before");
-                let stage = self.new_stage(shuf.get_rdd_base(), Some(shuf.clone()));
-                self.shuffle_to_map_stage
-                    .lock()
-                    .insert(shuf.get_shuffle_id(), stage.clone());
-                info!("inside get_shufflemap return");
-                stage
-            }
-        }
-    }
-
-    fn new_stage(
-        &self,
-        rdd_base: Arc<dyn RddBase>,
-        shuffle_dependency: Option<Arc<dyn ShuffleDependencyTrait>>,
-    ) -> Stage {
-        info!("inside new stage");
-        env::env
-            .cache_tracker
-            .register_rdd(rdd_base.get_rdd_id(), rdd_base.number_of_splits());
-        if let Some(shuffle_dependency) = shuffle_dependency.clone() {
-            info!("shuffle dependcy and registering mapoutput tracker");
-            self.map_output_tracker.register_shuffle(
-                shuffle_dependency.get_shuffle_id(),
-                rdd_base.number_of_splits(),
-            );
-            info!("new stage tracker after");
-        };
-        let id = self.next_stage_id.fetch_add(1, Ordering::SeqCst);
-        info!("new stage id {}", id);
-        let stage = Stage::new(
-            id,
-            rdd_base.clone(),
-            shuffle_dependency,
-            self.get_parent_stages(rdd_base),
-        );
-        self.id_to_stage.lock().insert(id, stage.clone());
-        info!("new stage stage return");
-        stage
-    }
-
-    fn visit_for_parent_stages(
-        &self,
-        parents: &mut BTreeSet<Stage>,
-        visited: &mut BTreeSet<Arc<dyn RddBase>>,
-        rdd: Arc<dyn RddBase>,
-    ) {
-        info!(
-            "parent stages {:?}",
-            parents.iter().map(|x| x.id).collect::<Vec<_>>()
-        );
-        info!(
-            "visisted stages {:?}",
-            visited.iter().map(|x| x.get_rdd_id()).collect::<Vec<_>>()
-        );
-        if !visited.contains(&rdd) {
-            visited.insert(rdd.clone());
-            env::env
-                .cache_tracker
-                .register_rdd(rdd.get_rdd_id(), rdd.number_of_splits());
-            for dep in rdd.get_dependencies() {
-                match dep {
-                    Dependency::ShuffleDependency(shuf_dep) => {
-                        parents.insert(self.get_shuffle_map_stage(shuf_dep.clone()));
-                    }
-                    Dependency::OneToOneDependency(oto_dep) => {
-                        self.visit_for_parent_stages(parents, visited, oto_dep.get_rdd_base())
-                    }
-                    Dependency::NarrowDependency(nar_dep) => {
-                        self.visit_for_parent_stages(parents, visited, nar_dep.get_rdd_base())
-                    } //TODO finish range dependency
-                }
-            }
-        }
-    }
-
-    fn get_parent_stages(&self, rdd: Arc<dyn RddBase>) -> Vec<Stage> {
-        info!("inside get parent stages");
-        let mut parents: BTreeSet<Stage> = BTreeSet::new();
-        let mut visited: BTreeSet<Arc<dyn RddBase>> = BTreeSet::new();
-        self.visit_for_parent_stages(&mut parents, &mut visited, rdd.clone());
-        info!(
-            "parent stages {:?}",
-            parents.iter().map(|x| x.id).collect::<Vec<_>>()
-        );
-        parents.into_iter().collect()
-    }
-
-    fn visit_for_missing_parent_stages(
-        &self,
-        missing: &mut BTreeSet<Stage>,
-        visited: &mut BTreeSet<Arc<dyn RddBase>>,
-        rdd: Arc<dyn RddBase>,
-    ) {
-        info!(
-            "missing stages {:?}",
-            missing.iter().map(|x| x.id).collect::<Vec<_>>()
-        );
-        info!(
-            "visisted stages {:?}",
-            visited.iter().map(|x| x.get_rdd_id()).collect::<Vec<_>>()
-        );
-        if !visited.contains(&rdd) {
-            visited.insert(rdd.clone());
-            // TODO CacheTracker register
-            for p in 0..rdd.number_of_splits() {
-                let locs = self.get_cache_locs(rdd.clone());
-                info!("cache locs {:?}", locs);
-                if locs == None {
-                    for dep in rdd.get_dependencies() {
-                        info!("for dep in missing stages ");
-                        match dep {
-                            Dependency::ShuffleDependency(shuf_dep) => {
-                                let stage = self.get_shuffle_map_stage(shuf_dep.clone());
-                                info!("shuffle stage in missing stages {:?}", stage.id);
-                                if !stage.is_available() {
-                                    info!(
-                                        "inserting shuffle stage in missing stages {:?}",
-                                        stage.id
-                                    );
-                                    missing.insert(stage);
-                                }
-                            }
-                            Dependency::NarrowDependency(nar_dep) => {
-                                info!("narrow stage in missing stages ");
-                                self.visit_for_missing_parent_stages(
-                                    missing,
-                                    visited,
-                                    nar_dep.get_rdd_base(),
-                                )
-                            }
-                            Dependency::OneToOneDependency(one_dep) => {
-                                info!("one to one stage in missing stages ");
-                                self.visit_for_missing_parent_stages(
-                                    missing,
-                                    visited,
-                                    one_dep.get_rdd_base(),
-                                )
-                            } //TODO finish range dependency
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn get_missing_parent_stages(&self, stage: Stage) -> Vec<Stage> {
-        info!("inside get missing parent stages");
-        let mut missing: BTreeSet<Stage> = BTreeSet::new();
-        let mut visited: BTreeSet<Arc<dyn RddBase>> = BTreeSet::new();
-        self.visit_for_missing_parent_stages(&mut missing, &mut visited, stage.get_rdd());
-        missing.into_iter().collect()
-    }
-
-    pub fn run_job<T: Data, U: Data, F, RT>(
-        &self,
+    pub fn run_job<T: Data, U: Data, F>(
+        self: Arc<Self>,
         func: Arc<F>,
-        final_rdd: Arc<RT>,
+        final_rdd: Arc<dyn Rdd<Item = T>>,
         partitions: Vec<usize>,
         allow_local: bool,
-    ) -> Vec<U>
+    ) -> Result<Vec<U>>
     where
-        F: SerFunc((TasKContext, Box<dyn Iterator<Item = T>>)) -> U,
-        RT: Rdd<T> + 'static,
+        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
     {
-        info!(
-            "shuffle maanger in final rdd of run job {:?}",
-            env::env.shuffle_manager
-        );
-        let thread_pool = Arc::new(ThreadPool::new(self.threads));
-        let run_id = self.next_run_id.fetch_add(1, Ordering::SeqCst);
-        let output_parts = partitions;
-        let num_output_parts = output_parts.len();
-        let final_stage = self.new_stage(final_rdd.clone(), None);
-        let mut results: Vec<Option<U>> = (0..num_output_parts).map(|_| None).collect();
-        let mut finished: Vec<bool> = (0..num_output_parts).map(|_| false).collect();
-        let mut num_finished = 0;
-        let mut waiting: BTreeSet<Stage> = BTreeSet::new();
-        let mut running: BTreeSet<Stage> = BTreeSet::new();
-        let mut failed: BTreeSet<Stage> = BTreeSet::new();
-        let mut pending_tasks: BTreeMap<Stage, BTreeSet<Box<dyn TaskBase>>> = BTreeMap::new();
-        let mut fetch_failure_duration = Duration::new(0, 0);
+        // acquiring lock so that only one job can run a same time this lock is just
+        // a temporary patch for preventing multiple jobs to update cache locks which affects
+        // construction of dag task graph. dag task graph construction need to be altered
+        let _lock = self.scheduler_lock.lock();
+        let jt = JobTracker::from_scheduler(&*self, func, final_rdd.clone(), partitions);
 
         //TODO update cache
-        //TODO logging
 
-        if allow_local && final_stage.parents.is_empty() && (num_output_parts == 1) {
-            let split = (final_rdd.splits()[output_parts[0]]).clone();
-            let task_context = TasKContext::new(final_stage.id, output_parts[0], 0);
-            return vec![func((task_context, final_rdd.iterator(split)))];
+        if allow_local {
+            if let Some(result) = LocalScheduler::local_execution(jt.clone())? {
+                return Ok(result);
+            }
         }
 
-        self.event_queues.lock().insert(run_id, VecDeque::new());
+        self.event_queues.insert(jt.run_id, VecDeque::new());
 
-        self.submit_stage(
-            final_stage.clone(),
-            &mut waiting,
-            &mut running,
-            &mut finished,
-            &mut pending_tasks,
-            output_parts.clone(),
-            num_output_parts,
-            final_stage.clone(),
-            func.clone(),
-            final_rdd.clone(),
-            run_id,
-            thread_pool.clone(),
-        );
-        info!(
-            "pending stages and tasks {:?}",
-            pending_tasks
-                .iter()
-                .map(|(k, v)| (k.id, v.iter().map(|x| x.get_task_id()).collect::<Vec<_>>()))
-                .collect::<Vec<_>>()
-        );
+        let self_clone = Arc::clone(&self);
+        let jt_clone = jt.clone();
+        // run in async executor
+        let executor = env::Env::get_async_handle();
+        let results = executor.enter(move || {
+            let self_borrow = &*self_clone;
+            let jt = jt_clone;
+            let mut results: Vec<Option<U>> = (0..jt.num_output_parts).map(|_| None).collect();
+            let mut fetch_failure_duration = Duration::new(0, 0);
 
-        while num_finished != num_output_parts {
-            let event_option = self.wait_for_event(run_id, self.poll_timeout);
-            let start_time = Instant::now();
+            self_borrow.submit_stage(jt.final_stage.clone(), jt.clone());
+            utils::yield_tokio_futures();
+            log::debug!(
+                "pending stages and tasks: {:?}",
+                jt.pending_tasks
+                    .lock()
+                    .iter()
+                    .map(|(k, v)| (k.id, v.iter().map(|x| x.get_task_id()).collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+            );
 
-            if let Some(mut evt) = event_option {
-                info!("event starting");
-                let stage = self.id_to_stage.lock()[&evt.task.get_stage_id()].clone();
-                info!(
-                    "removing stage task from pending tasks {} {}",
-                    stage.id,
-                    evt.task.get_task_id()
-                );
-                pending_tasks.get_mut(&stage).unwrap().remove(&evt.task);
-                use super::dag_scheduler::TastEndReason::*;
-                match evt.reason {
-                    Success => {
-                        //TODO logging
-                        //TODO add to Accumulator
+            let mut num_finished = 0;
+            while num_finished != jt.num_output_parts {
+                let event_option = self_borrow.wait_for_event(jt.run_id, self_borrow.poll_timeout);
+                let start_time = Instant::now();
 
-                        // ResultTask alone done now.
-                        //                        if let Some(result) = evt.get_result::<U>();
-                        let mut result_type = false;
-                        if let Some(_) = evt.task.downcast_ref::<ResultTask<T, U, RT, F>>() {
-                            result_type = true;
-                        }
-                        //                        println!("result task in master {} {:?}", self.master, result_type);
-                        if result_type {
-                            if let Ok(rt) = evt.task.downcast::<ResultTask<T, U, RT, F>>() {
-                                //                                println!(
-                                //                                    "result task result before unwrapping in master {}",
-                                //                                    self.master
-                                //                                );
-                                let result = evt
-                                    .result
-                                    .take()
-                                    .unwrap()
-                                    .downcast_ref::<U>()
-                                    .unwrap()
-                                    .clone();
-                                results[rt.output_id] = Some(result);
-                                finished[rt.output_id] = true;
-                                num_finished += 1;
-                            }
-                        } else if let Ok(smt) = evt.task.downcast::<ShuffleMapTask>() {
-                            let result = evt
-                                .result
-                                .take()
-                                .unwrap()
-                                .downcast_ref::<String>()
-                                .unwrap()
-                                .clone();
-                            //                                let result = *result;
-                            //                                let result: serde_traitobject::Box<serde_traitobject::Any> =
-                            //                                    evt.result.take().unwrap();
-                            //                                //                                let result = result.into_any();
-                            //                                let result: Box<String> =
-                            //                                    Box::<Any>::downcast(result.into_any()).unwrap();
-                            //                                //                                let result = result.downcast::<String>().unwrap();
-                            //                                let result = *result;
-                            //                                info!("result inside queue {:?}", result);
-                            self.id_to_stage
-                                .lock()
-                                .get_mut(&smt.stage_id)
-                                .unwrap()
-                                .add_output_loc(smt.partition, result);
-                            let stage = self.id_to_stage.lock().clone()[&smt.stage_id].clone();
-                            info!(
-                                "pending stages {:?}",
-                                pending_tasks
-                                    .iter()
-                                    .map(|(x, y)| (
-                                        x.id,
-                                        y.iter().map(|k| k.get_task_id()).collect::<Vec<_>>()
-                                    ))
-                                    .collect::<Vec<_>>()
-                            );
-                            info!(
-                                "pending tasks {:?}",
-                                pending_tasks
-                                    .get(&stage)
-                                    .unwrap()
-                                    .iter()
-                                    .map(|x| x.get_task_id())
-                                    .collect::<Vec<_>>()
-                            );
-                            info!(
-                                "running {:?}",
-                                running.iter().map(|x| x.id).collect::<Vec<_>>()
-                            );
-                            info!(
-                                "waiting {:?}",
-                                waiting.iter().map(|x| x.id).collect::<Vec<_>>()
-                            );
-
-                            if running.contains(&stage)
-                                && pending_tasks.get(&stage).unwrap().is_empty()
-                            {
-                                info!("here before registering map outputs ");
-                                //TODO logging
-                                running.remove(&stage);
-                                if !stage.shuffle_dependency.is_none() {
-                                    info!(
-                                        "stage output locs before register mapoutput tracker {:?}",
-                                        stage.output_locs
-                                    );
-                                    let locs = stage
-                                        .output_locs
-                                        .iter()
-                                        .map(|x| match x.get(0) {
-                                            Some(s) => Some(s.to_owned()),
-                                            None => None,
-                                        })
-                                        .collect();
-                                    info!(
-                                        "locs for shuffle id {:?} {:?}",
-                                        stage.clone().shuffle_dependency.unwrap().get_shuffle_id(),
-                                        locs
-                                    );
-                                    self.map_output_tracker.register_map_outputs(
-                                        stage.shuffle_dependency.unwrap().get_shuffle_id(),
-                                        locs,
-                                    );
-                                    info!("here after registering map outputs ");
-                                }
-                                //TODO Cache
-                                self.update_cache_locs();
-                                let mut newly_runnable = Vec::new();
-                                for stage in &waiting {
-                                    info!(
-                                        "waiting stage parent stages for stage {} are {:?}",
-                                        stage.id,
-                                        self.get_missing_parent_stages(stage.clone())
-                                            .iter()
-                                            .map(|x| x.id)
-                                            .collect::<Vec<_>>()
-                                    );
-                                    if self.get_missing_parent_stages(stage.clone()).is_empty() {
-                                        newly_runnable.push(stage.clone())
-                                    }
-                                }
-                                for stage in &newly_runnable {
-                                    waiting.remove(stage);
-                                }
-                                for stage in &newly_runnable {
-                                    running.insert(stage.clone());
-                                }
-                                for stage in newly_runnable {
-                                    self.submit_missing_tasks(
-                                        stage,
-                                        &mut finished,
-                                        &mut pending_tasks,
-                                        output_parts.clone(),
-                                        num_output_parts,
-                                        final_stage.clone(),
-                                        func.clone(),
-                                        final_rdd.clone(),
-                                        run_id,
-                                        thread_pool.clone(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    FetchFailed(FetchFailedVals {
-                        server_uri,
-                        shuffle_id,
-                        map_id,
-                        reduce_id,
-                    }) => {
-                        //TODO mapoutput tacker needs to be finished for this
-                        let failed_stage = self
-                            .id_to_stage
-                            .lock()
-                            .get(&evt.task.get_stage_id())
-                            .unwrap()
-                            .clone();
-                        running.remove(&failed_stage);
-                        failed.insert(failed_stage);
-                        //TODO logging
-                        let map_stage = self
-                            .shuffle_to_map_stage
-                            .lock()
-                            .get_mut(&shuffle_id)
-                            .unwrap()
-                            .remove_output_loc(map_id, server_uri.clone());
-                        self.map_output_tracker.unregister_map_output(
-                            shuffle_id,
-                            map_id,
-                            server_uri.clone(),
-                        );
-                        //logging
-                        failed.insert(
-                            self.shuffle_to_map_stage
-                                .lock()
-                                .get(&shuffle_id)
-                                .unwrap()
-                                .clone(),
-                        );
-                        fetch_failure_duration = start_time.elapsed();
-                    }
-                    _ => {
-                        //TODO error handling
-                    }
-                }
-            }
-            if !failed.is_empty() && fetch_failure_duration.as_millis() > self.resubmit_timeout {
-                self.update_cache_locs();
-                for stage in &failed {
-                    self.submit_stage(
-                        stage.clone(),
-                        &mut waiting,
-                        &mut running,
-                        &mut finished,
-                        &mut pending_tasks,
-                        output_parts.clone(),
-                        num_output_parts,
-                        final_stage.clone(),
-                        func.clone(),
-                        final_rdd.clone(),
-                        run_id,
-                        thread_pool.clone(),
+                if let Some(evt) = event_option {
+                    log::debug!("event starting");
+                    let stage = self_borrow
+                        .stage_cache
+                        .get(&evt.task.get_stage_id())
+                        .unwrap()
+                        .clone();
+                    log::debug!(
+                        "removing stage #{} task from pending task #{}",
+                        stage.id,
+                        evt.task.get_task_id()
                     );
+                    jt.pending_tasks
+                        .lock()
+                        .get_mut(&stage)
+                        .unwrap()
+                        .remove(&evt.task);
+                    use super::dag_scheduler::TastEndReason::*;
+                    match evt.reason {
+                        Success => self_borrow.on_event_success(
+                            evt,
+                            &mut results,
+                            &mut num_finished,
+                            jt.clone(),
+                        ),
+                        FetchFailed(failed_vals) => {
+                            self_borrow.on_event_failure(
+                                jt.clone(),
+                                failed_vals,
+                                evt.task.get_stage_id(),
+                            );
+                            fetch_failure_duration = start_time.elapsed();
+                        }
+                        _ => {
+                            //TODO error handling
+                        }
+                    }
                 }
-                failed.clear();
-            }
-        }
 
-        self.event_queues.lock().remove(&run_id);
-        //        let dur = time::Duration::from_millis(20000);
-        //        thread::sleep(dur);
-        results
+                if !jt.failed.lock().is_empty()
+                    && fetch_failure_duration.as_millis() > self_borrow.resubmit_timeout
+                {
+                    self_borrow.update_cache_locs();
+                    for stage in jt.failed.lock().iter() {
+                        self_borrow.submit_stage(stage.clone(), jt.clone());
+                    }
+                    utils::yield_tokio_futures();
+                    jt.failed.lock().clear();
+                }
+            }
+            results
+        });
+
+        self.event_queues.remove(&jt.run_id);
+        Ok(results
             .into_iter()
             .map(|s| match s {
                 Some(v) => v,
                 None => panic!("some results still missing"),
             })
-            .collect()
+            .collect())
     }
 
-    fn submit_stage<T: Data, U: Data, F, RT>(
-        &self,
-        stage: Stage,
-        waiting: &mut BTreeSet<Stage>,
-        running: &mut BTreeSet<Stage>,
-        finished: &mut Vec<bool>,
-        pending_tasks: &mut BTreeMap<Stage, BTreeSet<Box<dyn TaskBase>>>,
-        output_parts: Vec<usize>,
-        num_output_parts: usize,
-        final_stage: Stage,
-        func: Arc<F>,
-        final_rdd: Arc<RT>,
-        run_id: usize,
-        thread_pool: Arc<ThreadPool>,
-    ) where
-        F: SerFunc((TasKContext, Box<dyn Iterator<Item = T>>)) -> U,
-        RT: Rdd<T> + 'static,
-    {
-        info!("submiting stage {}", stage.id);
-        if !waiting.contains(&stage) && !running.contains(&stage) {
-            let missing = self.get_missing_parent_stages(stage.clone());
-            info!(
-                "inside submit stage missing stages {:?}",
-                missing.iter().map(|x| x.id).collect::<Vec<_>>()
-            );
-            if missing.is_empty() {
-                self.submit_missing_tasks(
-                    stage.clone(),
-                    finished,
-                    pending_tasks,
-                    output_parts.clone(),
-                    num_output_parts,
-                    final_stage.clone(),
-                    func,
-                    final_rdd.clone(),
-                    run_id,
-                    thread_pool.clone(),
-                );
-                running.insert(stage.clone());
-            } else {
-                for parent in missing {
-                    self.submit_stage(
-                        parent,
-                        waiting,
-                        running,
-                        finished,
-                        pending_tasks,
-                        output_parts.clone(),
-                        num_output_parts,
-                        final_stage.clone(),
-                        func.clone(),
-                        final_rdd.clone(),
-                        run_id,
-                        thread_pool.clone(),
-                    );
-                }
-                waiting.insert(stage.clone());
-            }
-        }
-    }
-
-    fn submit_missing_tasks<T: Data, U: Data, F, RT>(
-        &self,
-        stage: Stage,
-        finished: &mut Vec<bool>,
-        pending_tasks: &mut BTreeMap<Stage, BTreeSet<Box<dyn TaskBase>>>,
-        output_parts: Vec<usize>,
-        num_output_parts: usize,
-        final_stage: Stage,
-        func: Arc<F>,
-        final_rdd: Arc<RT>,
-        run_id: usize,
-        thread_pool: Arc<ThreadPool>,
-    ) where
-        F: SerFunc((TasKContext, Box<dyn Iterator<Item = T>>)) -> U,
-        RT: Rdd<T> + 'static,
-    {
-        let my_pending = pending_tasks
-            .entry(stage.clone())
-            .or_insert(BTreeSet::new());
-        if stage == final_stage {
-            info!("final stage {}", stage.id);
-            let mut id_in_job = 0;
-            for id in 0..num_output_parts {
-                let part = output_parts[id];
-                let locs = self.get_preferred_locs(final_rdd.clone() as Arc<dyn RddBase>, part);
-                let result_task = ResultTask::new(
-                    self.next_task_id.fetch_add(1, Ordering::SeqCst),
-                    run_id,
-                    final_stage.id,
-                    final_rdd.clone(),
-                    func.clone(),
-                    part,
-                    locs,
-                    id,
-                );
-                my_pending.insert(Box::new(result_task.clone()));
-                self.submit_task::<T, U, RT, F>(
-                    TaskOption::ResultTask(Box::new(result_task)),
-                    id_in_job,
-                    thread_pool.clone(),
-                );
-                id_in_job += 1;
-            }
-        } else {
-            let mut id_in_job = 0;
-            for p in 0..stage.num_partitions {
-                info!("shuffle_stage {}", stage.id);
-                if stage.output_locs[p].is_empty() {
-                    let locs = self.get_preferred_locs(stage.get_rdd(), p);
-                    info!("creating task for {} partition  {}", stage.id, p);
-                    let shuffle_map_task = ShuffleMapTask::new(
-                        self.next_task_id.fetch_add(1, Ordering::SeqCst),
-                        run_id,
-                        stage.id,
-                        stage.rdd.clone(),
-                        stage.shuffle_dependency.clone().unwrap(),
-                        p,
-                        locs,
-                    );
-                    info!(
-                        "creating task for {} partition  {} and shuffle id {}",
-                        stage.id,
-                        p,
-                        shuffle_map_task.dep.get_shuffle_id()
-                    );
-                    my_pending.insert(Box::new(shuffle_map_task.clone()));
-                    self.submit_task::<T, U, RT, F>(
-                        TaskOption::ShuffleMapTask(Box::new(shuffle_map_task)),
-                        id_in_job,
-                        thread_pool.clone(),
-                    );
-                    id_in_job += 1;
-                }
-            }
-        }
-    }
-
-    fn get_preferred_locs(&self, rdd: Arc<dyn RddBase>, partition: usize) -> Vec<Ipv4Addr> {
-        //TODO have to implement this completely
-        if let Some(cached) = self.get_cache_locs(rdd.clone()) {
-            if let Some(cached) = cached.get(partition) {
-                return cached.clone();
-            }
-        }
-        let rdd_prefs = rdd.preferred_locations(rdd.splits()[partition].clone());
-        if !rdd_prefs.is_empty() {
-            return rdd_prefs;
-        }
-        for dep in rdd.get_dependencies().iter() {
-            if let Dependency::NarrowDependency(nar_dep) = dep {
-                for in_part in nar_dep.get_parents(partition) {
-                    let locs = self.get_preferred_locs(nar_dep.get_rdd_base(), in_part);
-                    if !locs.is_empty() {
-                        return locs;
-                    }
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    fn wait_for_event(&self, run_id: usize, timeout: u64) -> Option<CompletionEvent> {
-        let end = Instant::now() + Duration::from_millis(timeout);
-        while self.event_queues.lock().get(&run_id).unwrap().is_empty() {
-            if Instant::now() > end {
-                return None;
-            } else{
-                thread::sleep(end - Instant::now());
-            }
-        }
-        self.event_queues
-            .lock()
-            .get_mut(&run_id)
-            .unwrap()
-            .pop_front()
-    }
-
-    fn submit_task<T: Data, U: Data, RT, F>(
-        &self,
+    async fn receive_results<T: Data, U: Data, F, R>(
+        event_queues: Arc<DashMap<usize, VecDeque<CompletionEvent>>>,
+        receiver: R,
         task: TaskOption,
-        id_in_job: usize,
-        thread_pool: Arc<ThreadPool>,
+        target_port: u16,
     ) where
-        F: SerFunc((TasKContext, Box<dyn Iterator<Item = T>>)) -> U,
-        RT: Rdd<T> + 'static,
+        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+        R: futures::AsyncRead + std::marker::Unpin,
     {
-        info!("inside submit task");
-        let my_attempt_id = self.attempt_id.fetch_add(1, Ordering::SeqCst);
-        let event_queues = self.event_queues.clone();
-        //        let ser_task = SerializeableTask { task };
-        //        let ser_task = task;
-        //
-        //        let task_bytes = bincode::serialize(&ser_task).unwrap();
-        //let server_port = self.port;
-        //        server_port = server_port - (server_port % 1000);
-        //        server_port = server_port + ser_task.get_task_id();
-        //info!("server port number {}", server_port);
-        //        let log_output = format!("task id {}", ser_task.get_task_id());
-        //        env::log_file.lock().write(&log_output.as_bytes());
-        if self.master {
-            //            self.server_uris.lock().push_front(server.clone());
-            //            let ten_millis = std::time::Duration::from_millis(1000);
-            //            thread::sleep(ten_millis);
-            let server_map = self.server_uris.lock().pop_back().unwrap();
-            self.server_uris.lock().push_front(server_map.clone());
-            let server_port = server_map.1;
-            //            client_port = client_port - (client_port % 1000);
-            //            client_port = client_port + ser_task.get_task_id();
-            let server_address = server_map.0.clone();
-            let event_queues_clone = event_queues.clone();
-            thread_pool.execute(move || {
-                while let Err(_) = TcpStream::connect(format!("{}:{}", server_address, server_port))
-                {
-                    continue;
+        let result: TaskResult = {
+            let message = capnp_futures::serialize::read_message(receiver, CAPNP_BUF_READ_OPTS)
+                .await
+                .unwrap()
+                .unwrap();
+            let task_data = message.get_root::<serialized_data::Reader>().unwrap();
+            log::debug!(
+                "received task #{} result of {} bytes from executor @{}",
+                task.get_task_id(),
+                task_data.get_msg().unwrap().len(),
+                target_port
+            );
+            bincode::deserialize(&task_data.get_msg().unwrap()).unwrap()
+        };
+
+        match task {
+            TaskOption::ResultTask(tsk) => {
+                let result = match result {
+                    TaskResult::ResultTask(r) => r,
+                    _ => panic!("wrong result type"),
+                };
+                if let Ok(task_final) = tsk.downcast::<ResultTask<T, U, F>>() {
+                    let task_final = task_final as Box<dyn TaskBase>;
+                    DistributedScheduler::task_ended(
+                        event_queues,
+                        task_final,
+                        TastEndReason::Success,
+                        // Can break in future. But actually not needed for distributed scheduler since task runs on different processes.
+                        // Currently using this because local scheduler needs it. It can be solved by refactoring tasks differently for local and distributed scheduler
+                        result.into_any_send_sync(),
+                    );
                 }
-                let ser_task = task;
-
-                let task_bytes = bincode::serialize(&ser_task).unwrap();
-                info!(
-                    "task in executor {} {:?} master",
-                    server_port,
-                    ser_task.get_task_id()
-                );
-                let mut stream =
-                    TcpStream::connect(format!("{}:{}", server_address, server_port)).unwrap();
-                info!(
-                    "task in executor {} {} master task len",
-                    server_port,
-                    task_bytes.len()
-                );
-                let mut message = ::capnp::message::Builder::new_default();
-                let mut task_data = message.init_root::<serialized_data::Builder>();
-                info!("sending data to server");
-                task_data.set_msg(&task_bytes);
-                serialize_packed::write_message(&mut stream, &message);
-
-                let r = ::capnp::message::ReaderOptions {
-                    traversal_limit_in_words: std::u64::MAX,
-                    nesting_limit: 64,
+            }
+            TaskOption::ShuffleMapTask(tsk) => {
+                let result = match result {
+                    TaskResult::ShuffleTask(r) => r,
+                    _ => panic!("wrong result type"),
                 };
-                let mut stream_r = std::io::BufReader::new(&mut stream);
-                let message_reader = serialize_packed::read_message(&mut stream_r, r).unwrap();
-                let task_data = message_reader
-                    .get_root::<serialized_data::Reader>()
-                    .unwrap();
-                info!(
-                    "task in executor {} {} master task result len",
-                    server_port,
-                    task_data.get_msg().unwrap().len()
-                );
-                let result: TaskResult =
-                    bincode::deserialize(&task_data.get_msg().unwrap()).unwrap();
-                match ser_task {
-                    TaskOption::ResultTask(tsk) => {
-                        let result = match result {
-                            TaskResult::ResultTask(r) => r,
-                            _ => panic!("wrong result type"),
-                        };
-                        if let Ok(task_final) = tsk.downcast::<ResultTask<T, U, RT, F>>() {
-                            let task_final = task_final as Box<dyn TaskBase>;
-                            DistributedScheduler::task_ended(
-                                event_queues_clone,
-                                task_final,
-                                TastEndReason::Success,
-                                // Can break in future. But actually not needed for distributed scheduler since task runs on different processes.
-                                // Currently using this because local scheduler needs it. It can be solved by refactoring tasks differently for local and distributed scheduler
-                                result.into_any_send_sync(),
-                            );
-                        }
-                    }
-                    TaskOption::ShuffleMapTask(tsk) => {
-                        let result = match result {
-                            TaskResult::ShuffleTask(r) => r,
-                            _ => panic!("wrong result type"),
-                        };
-                        if let Ok(task_final) = tsk.downcast::<ShuffleMapTask>() {
-                            let task_final = task_final as Box<dyn TaskBase>;
-                            DistributedScheduler::task_ended(
-                                event_queues_clone,
-                                task_final,
-                                TastEndReason::Success,
-                                result.into_any_send_sync(),
-                            );
-                        }
-                    }
-                };
-            })
-        }
+                if let Ok(task_final) = tsk.downcast::<ShuffleMapTask>() {
+                    let task_final = task_final as Box<dyn TaskBase>;
+                    DistributedScheduler::task_ended(
+                        event_queues,
+                        task_final,
+                        TastEndReason::Success,
+                        result.into_any_send_sync(),
+                    );
+                }
+            }
+        };
     }
 }
 
-//TODO Serialize and Deserialize
+impl NativeScheduler for DistributedScheduler {
+    fn submit_task<T: Data, U: Data, F>(
+        &self,
+        task: TaskOption,
+        _id_in_job: usize,
+        target_executor: SocketAddrV4,
+    ) where
+        F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+    {
+        if !env::Configuration::get().is_driver {
+            return;
+        }
+        log::debug!("inside submit task");
+        let event_queues_clone = self.event_queues.clone();
+        futures::executor::block_on(async move {
+            let mut num_retries = 0;
+            loop {
+                match TcpStream::connect(&target_executor).await {
+                    Ok(mut stream) => {
+                        let (reader, writer) = stream.split();
+                        let reader = reader.compat();
+                        let mut writer = writer.compat_write();
+                        let task_bytes = bincode::serialize(&task).unwrap();
+                        log::debug!(
+                            "sending task #{} of {} bytes to exec @{},",
+                            task.get_task_id(),
+                            task_bytes.len(),
+                            target_executor.port(),
+                        );
+
+                        let mut message = capnp::message::Builder::new_default();
+                        let mut task_data = message.init_root::<serialized_data::Builder>();
+                        task_data.set_msg(&task_bytes);
+                        capnp_serialize::write_message(&mut writer, &message)
+                            .await
+                            .map_err(Error::CapnpDeserialization)
+                            .unwrap();
+
+                        log::debug!("sent data to exec @{}", target_executor.port());
+
+                        // receive results back
+                        DistributedScheduler::receive_results::<T, U, F, _>(
+                            event_queues_clone,
+                            reader,
+                            task,
+                            target_executor.port(),
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(_) => {
+                        if num_retries > 5 {
+                            panic!("executor @{} not initialized", target_executor.port());
+                        }
+                        tokio::time::delay_for(Duration::from_millis(20)).await;
+                        num_retries += 1;
+                        continue;
+                    }
+                }
+            }
+        });
+    }
+
+    fn next_executor_server(&self, task: &dyn TaskBase) -> SocketAddrV4 {
+        if !task.is_pinned() {
+            // pick the first available server
+            let socket_addrs = self.server_uris.lock().pop_back().unwrap();
+            self.server_uris.lock().push_front(socket_addrs);
+            socket_addrs
+        } else {
+            // seek and pick the selected host
+            let servers = &mut *self.server_uris.lock();
+            let location: Ipv4Addr = task.preferred_locations()[0];
+            if let Some((pos, _)) = servers
+                .iter()
+                .enumerate()
+                .find(|(_, e)| *e.ip() == location)
+            {
+                let target_host = servers.remove(pos).unwrap();
+                servers.push_front(target_host.clone());
+                target_host
+            } else {
+                unreachable!()
+            }
+        }
+    }
+
+    impl_common_scheduler_funcs!();
+}

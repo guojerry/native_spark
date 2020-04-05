@@ -1,4 +1,5 @@
-use super::*;
+use crate::scheduler::Scheduler;
+use crate::task::TaskBase;
 use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
@@ -61,7 +62,5 @@ pub trait DAGScheduler: Scheduler {
         reason: TastEndReason,
         result: Box<dyn Any>,
         accum_updates: HashMap<i64, Box<dyn Any>>,
-    ) {
-        unimplemented!()
-    }
+    );
 }

@@ -1,23 +1,21 @@
-use super::*;
+use crate::serializable_traits::Data;
+use downcast_rs::Downcast;
 use fasthash::MetroHasher;
-//use objekt;
+use serde_derive::{Deserialize, Serialize};
+use serde_traitobject::{Deserialize, Serialize};
 use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 
-// Partitioner trait for creating Rdd partitions
-//pub trait Partitioner: objekt::Clone + Send + Sync  {
-//pub trait PartitionerBase: Serialize + Deserialize {
-//    fn equals(&self, other: &dyn Any) -> bool;
-//    fn get_num_of_partitions(&self) -> usize;
-//}
-
-pub trait Partitioner: Send + Sync + objekt::Clone + Serialize + Deserialize {
+/// Partitioner trait for creating Rdd partitions
+pub trait Partitioner:
+    Downcast + Send + Sync + dyn_clone::DynClone + Serialize + Deserialize
+{
     fn equals(&self, other: &dyn Any) -> bool;
     fn get_num_of_partitions(&self) -> usize;
     fn get_partition(&self, key: &dyn Any) -> usize;
 }
-objekt::clone_trait_object!(Partitioner);
+dyn_clone::clone_trait_object!(Partitioner);
 
 fn hash<T: Hash>(t: &T) -> u64 {
     let mut s: MetroHasher = Default::default();
@@ -41,19 +39,6 @@ impl<K: Data + Hash + Eq> HashPartitioner<K> {
     }
 }
 
-//impl<K: Data + Hash + Eq> PartitionerBase for HashPartitioner<K> {
-//    fn equals(&self, other: &dyn Any) -> bool {
-//        if let Some(hp) = other.downcast_ref::<HashPartitioner<K>>() {
-//            self.partitions == hp.partitions
-//        } else {
-//            false
-//        }
-//    }
-//    fn get_num_of_partitions(&self) -> usize {
-//        self.partitions
-//    }
-//}
-
 impl<K: Data + Hash + Eq> Partitioner for HashPartitioner<K> {
     fn equals(&self, other: &dyn Any) -> bool {
         if let Some(hp) = other.downcast_ref::<HashPartitioner<K>>() {
@@ -68,30 +53,14 @@ impl<K: Data + Hash + Eq> Partitioner for HashPartitioner<K> {
     fn get_partition(&self, key: &dyn Any) -> usize {
         let key = key.downcast_ref::<K>().unwrap();
         hash(key) as usize % self.partitions
-        //        if modulus < 0 {
-        //            modulus + self.partitions
-        //        } else {
-        //            modulus
-        //        }
     }
 }
-
-//impl PartialEq<Any> for HashPartitioner {
-//    fn eq(&self, other: &Any) -> bool {
-//        if let Some(hp) = other.downcast_ref::<HashPartitioner>() {
-//            self.partitions == hp.partitions
-//        } else {
-//            false
-//        }
-//    }
-//}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn hash_partition() {
-        //let data = vec![1, 2, 3, 4, 5, 6, 7, 8, 8, 8];
         let data = vec![1, 2];
         let num_partition = 3;
         let hash_partitioner = HashPartitioner::<i32>::new(num_partition);
@@ -141,6 +110,10 @@ mod tests {
             .clone()
             .map_or(false, |p| (&p).equals(&p1.clone().unwrap())));
         assert!(!p1.clone().map_or(false, |p| p.equals(&p2_1.clone())));
-        assert!(!p1.clone().map_or(false, |p| p.equals(&p2_2.clone())));
+        assert!(!p1.map_or(false, |p| p.equals(&p2_2.clone())));
+
+        let p2_1 = Box::new(p2_1) as Box<dyn Partitioner>;
+        let p2_2 = Box::new(p2_2) as Box<dyn Partitioner>;
+        assert!(p2_1.equals((&*p2_2).as_any()))
     }
 }

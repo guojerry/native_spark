@@ -1,17 +1,22 @@
-use super::*;
-use downcast_rs::Downcast;
 use std::cmp::Ordering;
 use std::net::Ipv4Addr;
 
-pub struct TasKContext {
+use crate::result_task::ResultTask;
+use crate::serializable_traits::{Data, SerFunc};
+use crate::shuffle::ShuffleMapTask;
+use downcast_rs::Downcast;
+use serde_derive::{Deserialize, Serialize};
+use serde_traitobject::{Deserialize, Serialize};
+
+pub struct TaskContext {
     pub stage_id: usize,
     pub split_id: usize,
     pub attempt_id: usize,
 }
 
-impl TasKContext {
+impl TaskContext {
     pub fn new(stage_id: usize, split_id: usize, attempt_id: usize) -> Self {
-        TasKContext {
+        TaskContext {
             stage_id,
             split_id,
             attempt_id,
@@ -23,6 +28,9 @@ pub trait TaskBase: Downcast + Send + Sync {
     fn get_run_id(&self) -> usize;
     fn get_stage_id(&self) -> usize;
     fn get_task_id(&self) -> usize;
+    fn is_pinned(&self) -> bool {
+        false
+    }
     fn preferred_locations(&self) -> Vec<Ipv4Addr> {
         Vec::new()
     }
@@ -62,12 +70,7 @@ pub trait TaskBox: Task + Serialize + Deserialize + 'static + Downcast {}
 impl<K> TaskBox for K where K: Task + Serialize + Deserialize + 'static {}
 
 impl_downcast!(TaskBox);
-//#[derive(Serialize, Deserialize)]
-//pub struct SerializeableTask {
-//    #[serde(with = "serde_traitobject")]
-//    pub task: Box<TaskBox>,
-//}
-//
+
 #[derive(Serialize, Deserialize)]
 pub enum TaskOption {
     #[serde(with = "serde_traitobject")]
@@ -75,14 +78,28 @@ pub enum TaskOption {
     #[serde(with = "serde_traitobject")]
     ShuffleMapTask(Box<dyn TaskBox>),
 }
-//
+
+impl<T: Data, U: Data, F> From<ResultTask<T, U, F>> for TaskOption
+where
+    F: SerFunc((TaskContext, Box<dyn Iterator<Item = T>>)) -> U,
+{
+    fn from(t: ResultTask<T, U, F>) -> Self {
+        TaskOption::ResultTask(Box::new(t) as Box<dyn TaskBox>)
+    }
+}
+
+impl From<ShuffleMapTask> for TaskOption {
+    fn from(t: ShuffleMapTask) -> Self {
+        TaskOption::ResultTask(Box::new(t))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum TaskResult {
-    //    //    #[serde(with = "serde_traitobject")]
     ResultTask(serde_traitobject::Box<dyn serde_traitobject::Any + Send + Sync>),
     ShuffleTask(serde_traitobject::Box<dyn serde_traitobject::Any + Send + Sync>),
 }
-//
+
 impl TaskOption {
     pub fn run(&self, id: usize) -> TaskResult {
         match self {
@@ -90,18 +107,21 @@ impl TaskOption {
             TaskOption::ShuffleMapTask(tsk) => TaskResult::ShuffleTask(tsk.run(id)),
         }
     }
+
     pub fn get_task_id(&self) -> usize {
         match self {
             TaskOption::ResultTask(tsk) => tsk.get_task_id(),
             TaskOption::ShuffleMapTask(tsk) => tsk.get_task_id(),
         }
     }
+
     pub fn get_run_id(&self) -> usize {
         match self {
             TaskOption::ResultTask(tsk) => tsk.get_run_id(),
             TaskOption::ShuffleMapTask(tsk) => tsk.get_run_id(),
         }
     }
+
     pub fn get_stage_id(&self) -> usize {
         match self {
             TaskOption::ResultTask(tsk) => tsk.get_stage_id(),

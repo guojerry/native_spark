@@ -1,6 +1,11 @@
-use super::*;
 use std::net::SocketAddr;
 use std::path::Path;
+
+use crate::error::{Error, Result};
+use once_cell::sync::OnceCell;
+use serde_derive::Deserialize;
+
+static HOSTS: OnceCell<Hosts> = OnceCell::new();
 
 /// Handles loading of the hosts configuration.
 #[derive(Debug, Deserialize)]
@@ -11,7 +16,11 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    pub fn load() -> Result<Self> {
+    pub fn get() -> Result<&'static Hosts> {
+        HOSTS.get_or_try_init(Self::load)
+    }
+
+    fn load() -> Result<Self> {
         let home = std::env::home_dir().ok_or(Error::NoHome)?;
         Hosts::load_from(home.join("hosts.conf"))
     }
@@ -32,11 +41,12 @@ impl Hosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_missing_hosts_file() {
         match Hosts::load_from("/does_not_exist").unwrap_err() {
-            Error::LoadHosts { source: _, path: _ } => {}
+            Error::LoadHosts { .. } => {}
             _ => panic!("Expected Error::LoadHosts"),
         }
     }
@@ -47,7 +57,7 @@ mod tests {
         file.write_all("invalid data".as_ref()).unwrap();
 
         match Hosts::load_from(&path).unwrap_err() {
-            Error::ParseHosts { source: _, path: _ } => {}
+            Error::ParseHosts { .. } => {}
             _ => panic!("Expected Error::ParseHosts"),
         }
     }

@@ -1,121 +1,59 @@
 #![feature(
+    arbitrary_self_types,
     coerce_unsized,
     core_intrinsics,
     fn_traits,
+    never_type,
     specialization,
     unboxed_closures,
-    arbitrary_self_types,
     unsize
 )]
-#![allow(
-    dead_code,
-    unused,
-    where_clauses_object_safety,
-    non_upper_case_globals,
-    deprecated
-)]
+#![allow(dead_code, where_clauses_object_safety, deprecated)]
+#![allow(clippy::single_component_path_imports)]
+
 #[macro_use]
 extern crate downcast_rs;
 #[macro_use]
 extern crate serde_closure;
-#[macro_use]
-extern crate lazy_static;
-extern crate capnp;
-use log::{error, info};
-use std::io::prelude::*;
+
 pub mod serialized_data_capnp {
     include!(concat!(env!("OUT_DIR"), "/capnp/serialized_data_capnp.rs"));
 }
-//use serde_closure::Fn;
-use serde_derive::{Deserialize, Serialize};
-use serde_traitobject::{Deserialize, Serialize};
-use serialized_data_capnp::serialized_data;
 
 pub mod context;
-pub use context::*;
-
+pub use context::Context;
 mod executor;
-use executor::*;
-
 pub mod partitioner;
+mod shuffle;
 pub use partitioner::*;
-
+#[path = "rdd/rdd.rs"]
 pub mod rdd;
 pub use rdd::*;
-
-pub mod pair_rdd;
-pub use pair_rdd::*;
-
 pub mod io;
-
+pub use io::*;
 mod dependency;
-use dependency::*;
-
-mod shuffled_rdd;
-use shuffled_rdd::*;
-
-mod split;
-use split::*;
-
-mod parallel_collection;
-use parallel_collection::*;
-
-mod co_grouped_rdd;
-use co_grouped_rdd::*;
-
-mod cache_tracker;
-use cache_tracker::*;
-
+pub use dependency::*;
+pub mod split;
+pub use split::*;
 mod cache;
-use cache::*;
-
-mod shuffle_fetcher;
-use shuffle_fetcher::*;
-
-mod shuffle_manager;
-use shuffle_manager::*;
-
-mod shuffle_map_task;
-use shuffle_map_task::*;
-
+mod cache_tracker;
+#[macro_use]
 mod scheduler;
-use scheduler::*;
-
+pub mod aggregator;
 mod dag_scheduler;
-use dag_scheduler::*;
-
-mod task;
-use task::*;
-
-mod local_scheduler;
-use local_scheduler::*;
-
 mod distributed_scheduler;
-use distributed_scheduler::*;
-
+mod local_scheduler;
 mod stage;
-use stage::*;
-
-mod aggregator;
-use aggregator::*;
-
-mod map_output_tracker;
-use map_output_tracker::*;
-
-mod result_task;
-use result_task::*;
-
-mod job;
-use job::*;
-
-mod serializable_traits;
-use serializable_traits::{AnyData, Data, Func, SerFunc};
-
+mod task;
+pub use aggregator::*;
 mod env;
-//use env::*;
-
+mod job;
+mod map_output_tracker;
+mod result_task;
+pub mod serializable_traits;
+pub use env::DeploymentMode;
 pub mod error;
-pub use error::{Error, Result};
-
+pub use error::*;
+pub mod fs;
 mod hosts;
-use hosts::Hosts;
+pub mod utils;
